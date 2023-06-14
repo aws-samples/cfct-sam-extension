@@ -1,0 +1,1493 @@
+# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
+# A copy of the License is located at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# or in the "license" file accompanying this file. This file is distributed
+# on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+# express or implied. See the License for the specific language governing
+# permissions and limitations under the License.
+
+---
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: "cfct-sam-extension solution"
+
+Parameters:
+  EnabledRegions:
+    Type: CommaDelimitedList
+    Description: AWS Control Tower Enabled Regions. (e.g. us-east-1, eu-central-1)
+  CodePipelineSource:
+    Type: String
+    Description: Which AWS CodePipeline source provider do you want to select?
+    AllowedValues:
+      - AWS CodeCommit
+      - Amazon S3
+    Default: AWS CodeCommit
+  CodeCommitRepositoryName:
+    Type: String
+    Description: Name of the CodeCommit repository that contains AWS SAM packages. The suffix .git is prohibited. (Only applicable if 'AWS CodeCommit' was selected as the CodePipeline Source)
+    AllowedPattern: ^[\w\.-]+
+    Default: cfct-sam-extension-configuration
+  EnableContinuousDeployment:
+    Type: String
+    Description: Enable Continuous Deployment of AWS SAM packages with CfCT. Each successful run of cfct-sam-extension Pipeline will trigger a CfCT build.
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "true"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Regions
+        Parameters:
+          - EnabledRegions
+      - Label:
+          default: Pipeline Configuration
+        Parameters:
+          - CodePipelineSource
+          - CodeCommitRepositoryName
+          - EnableContinuousDeployment
+
+    ParameterLabels:
+      EnabledRegions:
+        default: Enabled Regions
+      CodePipelineSource:
+        default: AWS CodePipeline Source
+      CodeCommitRepositoryName:
+        default: CodeCommit Repository Name
+      EnableContinuousDeployment:
+        default: Enable Continuous Deployment
+
+Mappings:
+  CodePipelineSource:
+    CodeCommit:
+      BranchName: main
+    S3Bucket:
+      TriggerKey: cfct-sam-extension-configuration.zip
+  SSM:
+    Parameters:
+      Path: "/cfct-sam-extension"
+  S3:
+    SAMPackageBuckets:
+      NamePrefix: cfct-sam-extension-packages-
+  KMS:
+    Alias:
+      Name: CustomControlTowerSamExtensionKMSKey
+
+Conditions:
+  IsCodeCommitPipelineSource:
+    !Equals [!Ref CodePipelineSource, "AWS CodeCommit"]
+  IsS3PipelineSource: !Equals [!Ref CodePipelineSource, "Amazon S3"]
+  IsContinuousDeploymentEnabled:
+    !Equals [!Ref EnableContinuousDeployment, "true"]
+
+Resources:
+  ###
+  # KMS Key
+  ###
+
+  Key:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "Allow administration of the key"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action:
+              - "kms:Create*"
+              - "kms:Describe*"
+              - "kms:Enable*"
+              - "kms:List*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:ScheduleKeyDeletion"
+              - "kms:CancelKeyDeletion"
+            Resource: "*"
+          - Sid: "Allow use of the key"
+            Effect: "Allow"
+            Principal:
+              AWS:
+                - !GetAtt CustomControlTowerSamExtensionCodeBuildRole.Arn
+                - !GetAtt CustomControlTowerSamExtensionCodePipelineRole.Arn
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+
+  KeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub
+        - alias/${KeyName}
+        - { KeyName: !FindInMap [KMS, Alias, Name] }
+      TargetKeyId: !Ref Key
+
+  ###
+  # Delete SSM Parameters created dynamically by CodeBuild
+  ###
+
+  DeleteSsmParametersLambda:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "This lambda function does not need access to VPC resources"
+          - id: W92
+            reason: "This use case does not need to set the ReservedConcurrentExecutions"
+    Properties:
+      FunctionName: CustomControlTowerSamExtensionDeleteSsmParametersLambda
+      Description: Lambda function to delete SSM Parameters created by CfCT SAM Extension
+      Handler: index.lambda_handler
+      Runtime: python3.10
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParametersByPath
+                - ssm:DeleteParameters
+              Resource:
+                !Join [
+                  "",
+                  [
+                    !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter",
+                    !FindInMap [SSM, Parameters, Path],
+                    "*",
+                  ],
+                ]
+      InlineCode: |
+        import logging
+        import boto3
+        import cfnresponse
+        import json
+
+        logging.root.setLevel(logging.DEBUG)
+
+        ssm_client = boto3.client('ssm')
+
+
+        def lambda_handler(event, context):
+
+            ssm_parameters_path = event['ResourceProperties']['SsmParametersPath']
+
+            cfn_response = cfnresponse.SUCCESS
+
+            # Setting a fixed resource id to prevent unintentional replacements of the custom resource
+            resource_id = "DeleteSsmParametersLambda"
+            cfn_response_data = {}
+
+            try:
+                if event['RequestType'] == 'Delete':
+
+                    # Create a reusable Paginator to get all parameters by path
+                    paginator = ssm_client.get_paginator('get_parameters_by_path')
+
+                    # Create a PageIterator from the Paginator
+                    page_iterator = paginator.paginate(
+                        Path=ssm_parameters_path,
+                        Recursive=True,
+                    )
+
+                    parameter_names = []
+
+                    for page in page_iterator:
+                        for parameter in page['Parameters']:
+                            parameter_names.append(parameter['Name'])
+
+                    if len(parameter_names) > 0:
+                        # Delete parameters
+                        ssm_client.delete_parameters(
+                            Names=parameter_names
+                        )
+                        logging.debug("Deleted all parameters!")
+                    else:
+                        logging.debug("Did not find any parameters to delete!")
+
+            except Exception as ex:
+                cfn_response = cfnresponse.FAILED
+                cfn_response_data = {"Exception": str(ex)}
+                logging.error(f"Exception: {str(ex)}")
+
+            cfnresponse.send(event, context, cfn_response,
+                            cfn_response_data, resource_id)
+
+  DeleteSsmParametersLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${DeleteSsmParametersLambda}
+      RetentionInDays: 7
+
+  DeleteSsmParameters:
+    Type: Custom::CustomResource
+    Properties:
+      ServiceToken: !GetAtt DeleteSsmParametersLambda.Arn
+      SsmParametersPath: !FindInMap [SSM, Parameters, Path]
+
+  ###
+  # Empty S3 buckets created by CloudFormation so that they can be deleted
+  ###
+
+  EmptyS3BucketsLambda:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "This lambda function does not need access to VPC resources"
+          - id: W92
+            reason: "This use case does not need to set the ReservedConcurrentExecutions"
+    Properties:
+      FunctionName: CustomControlTowerSamExtensionEmptyS3BucketsLambda
+      Description: Lambda function to empty S3 buckets created by CfCT SAM Extension to allow deletion
+      Handler: index.lambda_handler
+      Runtime: python3.10
+      Timeout: 300
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:DeleteObject
+                - s3:DeleteObjectVersion
+              Resource:
+                - !If
+                  - IsS3PipelineSource
+                  - !Sub "${CustomControlTowerSamExtensionPipelineS3Bucket.Arn}/*"
+                  - !Ref AWS::NoValue
+                - !If
+                  - IsS3PipelineSource
+                  - !Sub "${CustomControlTowerSamExtensionCloudTrailDataEventsBucket.Arn}/*"
+                  - !Ref AWS::NoValue
+                - !Sub "${CustomControlTowerSamExtensionPipelineArtifactS3Bucket.Arn}/*"
+                - !Sub "${CustomControlTowerSamExtensionS3AccessLogsBucket.Arn}/*"
+            - Effect: Allow
+              Action:
+                - s3:ListBucketVersions
+              Resource:
+                - !If
+                  - IsS3PipelineSource
+                  - !GetAtt CustomControlTowerSamExtensionPipelineS3Bucket.Arn
+                  - !Ref AWS::NoValue
+                - !If
+                  - IsS3PipelineSource
+                  - !GetAtt CustomControlTowerSamExtensionCloudTrailDataEventsBucket.Arn
+                  - !Ref AWS::NoValue
+                - !GetAtt CustomControlTowerSamExtensionPipelineArtifactS3Bucket.Arn
+                - !GetAtt CustomControlTowerSamExtensionS3AccessLogsBucket.Arn
+      InlineCode: |
+        import logging
+        import boto3
+        import cfnresponse
+        import json
+
+        logging.root.setLevel(logging.DEBUG)
+
+        s3_resource = boto3.resource('s3')
+
+
+        def lambda_handler(event, context):
+
+            buckets = event['ResourceProperties']['Buckets']
+
+            cfn_response = cfnresponse.SUCCESS
+
+            # Setting a fixed resource id to prevent unintentional replacements of the custom resource
+            resource_id = "EmptyS3BucketsLambda"
+            cfn_response_data = {}
+
+            try:
+                if event['RequestType'] == 'Delete':
+                    for bucket in buckets.split(","):
+                        # Delete all object versions
+                        s3_bucket = s3_resource.Bucket(bucket)
+                        s3_bucket.object_versions.delete()
+                        logging.debug(f"Emptied bucket {bucket}!")
+
+            except Exception as ex:
+                cfn_response = cfnresponse.FAILED
+                cfn_response_data = {"Exception": str(ex)}
+                logging.error(f"Exception: {str(ex)}")
+
+            cfnresponse.send(event, context, cfn_response, cfn_response_data, resource_id)
+
+  EmptyS3BucketsLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${EmptyS3BucketsLambda}
+      RetentionInDays: 7
+
+  EmptyS3Buckets:
+    Type: Custom::CustomResource
+    Properties:
+      ServiceToken: !GetAtt EmptyS3BucketsLambda.Arn
+      Buckets:
+        !Join [
+          ",",
+          [
+            !If [
+              IsS3PipelineSource,
+              !Ref CustomControlTowerSamExtensionPipelineS3Bucket,
+              !Ref AWS::NoValue,
+            ],
+            !If [
+              IsS3PipelineSource,
+              !Ref CustomControlTowerSamExtensionCloudTrailDataEventsBucket,
+              !Ref AWS::NoValue,
+            ],
+            !Ref CustomControlTowerSamExtensionPipelineArtifactS3Bucket,
+            !Ref CustomControlTowerSamExtensionS3AccessLogsBucket,
+          ],
+        ]
+
+  ###
+  # S3 destination buckets creation for SAM builds/lambdas
+  ###
+
+  SAMPackageBucketsCreatorLambda:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "This lambda function does not need access to VPC resources"
+          - id: W92
+            reason: "This use case does not need to set the ReservedConcurrentExecutions"
+          - id: W11
+            reason: "Allow Resource * for Organizations API: Needed to get organization id"
+    Properties:
+      FunctionName: CustomControlTowerSamExtensionSAMPackageBucketsCreatorLambda
+      Description: Lambda function to create S3 buckets to store SAM packages
+      Handler: index.lambda_handler
+      Runtime: python3.10
+      Timeout: 600
+      MemorySize: 128
+      Environment:
+        Variables:
+          DestinationBucketWithoutRegion:
+            !Join [
+              "",
+              [
+                !FindInMap [S3, SAMPackageBuckets, NamePrefix],
+                !Ref AWS::AccountId,
+              ],
+            ]
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+                - s3:ListBucketVersions
+                - s3:CreateBucket
+                - s3:PutBucketPolicy
+                - s3:PutBucketVersioning
+                - s3:DeleteBucket
+              Resource:
+                !Join [
+                  "",
+                  [
+                    !Sub "arn:${AWS::Partition}:s3:::",
+                    !FindInMap [S3, SAMPackageBuckets, NamePrefix],
+                    !Ref AWS::AccountId,
+                    "-*",
+                  ],
+                ]
+            - Effect: Allow
+              Action:
+                - s3:DeleteObject
+                - s3:DeleteObjectVersion
+              Resource:
+                !Join [
+                  "",
+                  [
+                    !Sub "arn:${AWS::Partition}:s3:::",
+                    !FindInMap [S3, SAMPackageBuckets, NamePrefix],
+                    !Ref AWS::AccountId,
+                    "-*/*",
+                  ],
+                ]
+            - Effect: Allow
+              Action:
+                - organizations:DescribeOrganization
+              Resource: "*"
+      InlineCode: |
+        import logging
+        import boto3
+        from botocore.exceptions import ClientError
+        import cfnresponse
+        import os
+        import json
+
+        logging.root.setLevel(logging.DEBUG)
+
+        destination_bucket = os.environ.get("DestinationBucketWithoutRegion")
+
+
+        def lambda_handler(event, context):
+
+            enabled_regions = event['ResourceProperties']['EnabledRegions']
+
+            logging.debug(f"enabled_regions={enabled_regions}")
+            logging.debug(f"destination_bucket={destination_bucket}")
+
+            cfn_response = cfnresponse.SUCCESS
+
+            # Setting a fixed resource id to prevent unintentional replacements of the custom resource
+            resource_id = "SAMPackageBucketsCreatorLambda"
+            cfn_response_data = {}
+
+            try:
+                # Get AWS partition
+                partition = boto3.Session().get_available_partitions()[0]
+                logging.debug(f"partition={partition}")
+
+                # Get organization id
+                organizations_client = boto3.client('organizations')
+                response = organizations_client.describe_organization()
+                organization_id = response['Organization']['Id']
+                logging.debug(f"organization_id={organization_id}")
+
+                for enabled_region in enabled_regions.split(","):
+                    bucket_name = f"{destination_bucket}-{enabled_region}"
+
+                    # Check if bucket already exists and skip it if so
+                    if event['RequestType'] == 'Update':
+                        bucket_exists = check_if_bucket_exists(
+                            bucket_name, enabled_region)
+
+                        if bucket_exists:
+                            continue
+
+                    elif event['RequestType'] == 'Delete':
+                        delete_bucket(bucket_name)
+                        continue
+
+                    bucket_policy = {
+                        'Version': '2012-10-17',
+                        'Statement': [
+                            {
+                                'Sid': 'AllowSslRequestsOnly',
+                                'Effect': 'Deny',
+                                'Principal': '*',
+                                'Action': 's3:*',
+                                'Resource': f'arn:{partition}:s3:::{bucket_name}/*',
+                                'Condition': {
+                                    'Bool': {
+                                        'aws:SecureTransport': 'false'
+                                    }
+                                }
+                            },
+                            {
+                                'Sid': 'AllowGetObjectForAWSControlTowerExecutionRoleInMemberAccounts',
+                                'Effect': 'Allow',
+                                'Principal': '*',
+                                'Action': ['s3:GetObject'],
+                                'Resource': f'arn:{partition}:s3:::{bucket_name}/*',
+                                'Condition': {
+                                    'StringEquals': {
+                                        'aws:PrincipalOrgID': f'{organization_id}'
+                                    },
+                                    'StringLike': {
+                                        'aws:PrincipalARN': f'arn:{partition}:iam::*:role/AWSControlTowerExecution'
+                                    }
+                                }
+                            }
+                        ]
+                    }
+
+                    # Convert the policy from JSON dict to string
+                    bucket_policy = json.dumps(bucket_policy)
+                    bucket_created = create_bucket(
+                        bucket_name, bucket_policy, enabled_region)
+
+                    if not bucket_created:
+                        cfn_response = cfnresponse.FAILED
+                        break
+
+            except Exception as ex:
+                cfn_response = cfnresponse.FAILED
+                cfn_response_data = {"Exception": str(ex)}
+                logging.error(f"Exception: {str(ex)}")
+
+            cfnresponse.send(event, context, cfn_response, cfn_response_data, resource_id)
+
+
+        def delete_bucket(bucket_name):
+            """Empties and deletes a specified bucket
+            :param bucket_name: Bucket to delete
+            :return: True if bucket is deleted, else False
+            """
+
+            # Delete all object versions
+            s3_resource = boto3.resource('s3')
+            s3_bucket = s3_resource.Bucket(bucket_name)
+            s3_bucket.object_versions.delete()
+            logging.debug(f"All object versions deleted from bucket {bucket_name}.")
+
+            # Delete bucket
+            s3_bucket.delete()
+            logging.debug(f"Bucket {bucket_name} was deleted.")
+
+
+        def check_if_bucket_exists(bucket_name, region):
+            """Check if an S3 bucket in a specified region exists
+            :param bucket_name: Bucket to check
+            :param region: String region where bucket exists in, (e.g. 'eu-central-1')
+            :return: True if bucket already exists, else False
+            """
+
+            s3_client = boto3.client('s3', region_name=region)
+
+            try:
+                s3_client.head_bucket(Bucket=bucket_name)
+
+            except ClientError as err:
+                status = err.response["ResponseMetadata"]["HTTPStatusCode"]
+                errcode = err.response["Error"]["Code"]
+                if status == 404:
+                    logging.debug(f"S3 bucket {bucket_name} does not exist.")
+                    return False
+                else:
+                    logging.error("Error in request, %s", errcode)
+            else:
+                logging.debug(f"S3 bucket {bucket_name} does already exist.")
+                return True
+
+
+        def create_bucket(bucket_name, bucket_policy, region):
+            """Create an S3 bucket in a specified region with given bucket policy
+            :param bucket_name: Bucket to create
+            :param region: String region to create bucket in, (e.g. 'eu-central-1')
+            :return: True if bucket created, else False
+            """
+
+            try:
+                s3_client = boto3.client('s3', region_name=region)
+
+                # We need special handling for creating buckets in 'us-east-1' region here
+                # See: https://github.com/boto/boto3/issues/125
+
+                if region == "us-east-1":
+                    s3_client.create_bucket(Bucket=bucket_name)
+                else:
+                    location = {"LocationConstraint": region}
+                    s3_client.create_bucket(
+                        Bucket=bucket_name,
+                        CreateBucketConfiguration=location
+                    )
+
+                logging.debug(f"Bucket {bucket_name} was created.")
+
+                # Set bucket policy
+                s3_client.put_bucket_policy(Bucket=bucket_name, Policy=bucket_policy)
+                logging.debug(f"Bucket policy was set.")
+
+                # Enable versioning
+                s3_client.put_bucket_versioning(
+                    Bucket=bucket_name,
+                    VersioningConfiguration={
+                        'Status': 'Enabled'
+                    }
+                )
+                logging.debug(f"Bucket versioning was enabled.")
+
+            except ClientError as e:
+                logging.error(f"S3 bucket {bucket_name} couldn't be created.")
+                logging.error(e)
+                return False
+            else:
+                return True
+
+  SAMPackageBucketsCreatorLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${SAMPackageBucketsCreatorLambda}
+      RetentionInDays: 7
+
+  CreateSAMPackageBuckets:
+    Type: Custom::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SAMPackageBucketsCreatorLambda.Arn
+      EnabledRegions: !Join [",", !Ref EnabledRegions]
+
+  ###
+  # SAM package source creations (CodeCommit/S3)
+  ###
+
+  # CfCT SAM Source AWS CodeCommit
+  CustomControlTowerSamExtensionCodeCommit:
+    Condition: IsCodeCommitPipelineSource
+    Type: AWS::CodeCommit::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryDescription: Configuration for Customizations for AWS Control Tower solution
+      RepositoryName: !Ref CodeCommitRepositoryName
+
+  # CfCT SAM Source Bucket
+  CustomControlTowerSamExtensionPipelineS3Bucket:
+    Condition: IsS3PipelineSource
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub cfct-sam-extension-source-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CustomControlTowerSamExtensionS3AccessLogsBucket
+
+  CustomControlTowerSamExtensionPipelineS3BucketPolicy:
+    Condition: IsS3PipelineSource
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CustomControlTowerSamExtensionPipelineS3Bucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyDeleteBucket
+            Effect: Deny
+            Principal: "*"
+            Action: s3:DeleteBucket
+            Resource: !GetAtt CustomControlTowerSamExtensionPipelineS3Bucket.Arn
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Action: s3:*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+            Resource:
+              - !GetAtt CustomControlTowerSamExtensionPipelineS3Bucket.Arn
+              - !Sub ${CustomControlTowerSamExtensionPipelineS3Bucket.Arn}/*
+            Principal: "*"
+
+  # CfCT SAM Pipeline Artifacts S3 Bucket
+  CustomControlTowerSamExtensionPipelineArtifactS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub cfct-sam-extension-pipeline-artifact-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CustomControlTowerSamExtensionS3AccessLogsBucket
+
+  CustomControlTowerSamExtensionPipelineArtifactS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CustomControlTowerSamExtensionPipelineArtifactS3Bucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyDeleteBucket
+            Effect: Deny
+            Principal: "*"
+            Action: s3:DeleteBucket
+            Resource: !GetAtt CustomControlTowerSamExtensionPipelineArtifactS3Bucket.Arn
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Action: s3:*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+            Resource:
+              - !GetAtt CustomControlTowerSamExtensionPipelineArtifactS3Bucket.Arn
+              - !Sub ${CustomControlTowerSamExtensionPipelineArtifactS3Bucket.Arn}/*
+            Principal: "*"
+
+  #
+  # S3 logs - feature adopted from CfCT itself
+  #
+
+  # Used for logging on S3 buckets (optional) and Pipeline artifacts S3 bucket
+  CustomControlTowerSamExtensionS3AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "This S3 bucket is used as the logs destination for other buckets"
+    Properties:
+      BucketName: !Sub cfct-sam-extension-access-logs-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+
+  CustomControlTowerSamExtensionS3AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CustomControlTowerSamExtensionS3AccessLogsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyDeleteBucket
+            Effect: Deny
+            Principal: "*"
+            Action: s3:DeleteBucket
+            Resource: !GetAtt CustomControlTowerSamExtensionS3AccessLogsBucket.Arn
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Action: s3:*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+            Resource:
+              - !GetAtt CustomControlTowerSamExtensionS3AccessLogsBucket.Arn
+              - !Sub ${CustomControlTowerSamExtensionS3AccessLogsBucket.Arn}/*
+            Principal: "*"
+          - !If
+            - IsS3PipelineSource
+            - Sid: EnableS3AccessLoggingForPipelineS3Bucket
+              Effect: Allow
+              Principal:
+                Service: logging.s3.amazonaws.com
+              Action:
+                - s3:PutObject
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${CustomControlTowerSamExtensionS3AccessLogsBucket}/*"
+              Condition:
+                ArnLike:
+                  "aws:SourceArn": !GetAtt CustomControlTowerSamExtensionPipelineS3Bucket.Arn
+                StringEquals:
+                  "aws:SourceAccount": !Ref AWS::AccountId
+            - !Ref AWS::NoValue
+          - !If
+            - IsS3PipelineSource
+            - Sid: EnableS3AccessLoggingForDataEventsBucket
+              Effect: Allow
+              Principal:
+                Service: logging.s3.amazonaws.com
+              Action:
+                - s3:PutObject
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${CustomControlTowerSamExtensionS3AccessLogsBucket}/*"
+              Condition:
+                ArnLike:
+                  "aws:SourceArn": !GetAtt CustomControlTowerSamExtensionCloudTrailDataEventsBucket.Arn
+                StringEquals:
+                  "aws:SourceAccount": !Ref AWS::AccountId
+            - !Ref AWS::NoValue
+          - Sid: EnableS3AccessLoggingForPipelineArtifactS3Bucket
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${CustomControlTowerSamExtensionS3AccessLogsBucket}/*"
+            Condition:
+              ArnLike:
+                "aws:SourceArn": !GetAtt CustomControlTowerSamExtensionPipelineArtifactS3Bucket.Arn
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+
+  ###
+  # CfCT SAM CodePipeline - feature adoptd from CfCT itself
+  ###
+
+  CustomControlTowerSamExtensionCodePipelineRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "The role name is defined to identify CfCT SAM Extension resources."
+    Properties:
+      RoleName: cfct-sam-extension-codepipeline
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "codepipeline.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: cfct-sam-extension-codepipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${CustomControlTowerSamExtensionPipelineArtifactS3Bucket}
+                  - !If
+                    - IsCodeCommitPipelineSource
+                    - !Ref AWS::NoValue
+                    - !Sub arn:${AWS::Partition}:s3:::${CustomControlTowerSamExtensionPipelineS3Bucket}
+              - Effect: "Allow"
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${CustomControlTowerSamExtensionPipelineArtifactS3Bucket}/*
+                  - !If
+                    - IsCodeCommitPipelineSource
+                    - !Ref AWS::NoValue
+                    - !Sub arn:${AWS::Partition}:s3:::${CustomControlTowerSamExtensionPipelineS3Bucket}/*
+              - Effect: "Allow"
+                Action:
+                  - "codebuild:BatchGetBuilds"
+                  - "codebuild:StartBuild"
+                Resource:
+                  - !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${CustomControlTowerSamExtensionCodeBuild}
+              - !If
+                - IsCodeCommitPipelineSource
+                - Effect: "Allow"
+                  Action:
+                    - codecommit:GetBranch
+                    - codecommit:GetCommit
+                    - codecommit:UploadArchive
+                    - codecommit:GetUploadArchiveStatus
+                    - codecommit:CancelUploadArchive
+                  Resource: !GetAtt CustomControlTowerSamExtensionCodeCommit.Arn
+                - !Ref AWS::NoValue
+
+  CustomControlTowerSamExtensionCodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: cfct-sam-extension
+      RoleArn: !GetAtt CustomControlTowerSamExtensionCodePipelineRole.Arn
+      ArtifactStore:
+        Location: !Ref CustomControlTowerSamExtensionPipelineArtifactS3Bucket
+        Type: S3
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: !If
+                - IsCodeCommitPipelineSource
+                - Category: Source
+                  Owner: AWS
+                  Version: "1"
+                  Provider: CodeCommit
+                - Category: Source
+                  Owner: AWS
+                  Version: "1"
+                  Provider: S3
+              OutputArtifacts:
+                - Name: SourceApp
+              Configuration: !If
+                - IsCodeCommitPipelineSource
+                - RepositoryName: !Ref CodeCommitRepositoryName
+                  BranchName:
+                    !FindInMap [CodePipelineSource, CodeCommit, BranchName]
+                  PollForSourceChanges: false
+                - S3Bucket: !Ref CustomControlTowerSamExtensionPipelineS3Bucket
+                  S3ObjectKey:
+                    !FindInMap [CodePipelineSource, S3Bucket, TriggerKey]
+                  PollForSourceChanges: false
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: CodeBuild
+              InputArtifacts:
+                - Name: SourceApp
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: "1"
+                Provider: CodeBuild
+              OutputArtifacts:
+                - Name: BuiltApp
+              Configuration:
+                ProjectName: !Ref CustomControlTowerSamExtensionCodeBuild
+
+  # CfCT SAM CodeBuild
+  CustomControlTowerSamExtensionCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: cfct-sam-extension-codebuild
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+              - Effect: "Allow"
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub ${CustomControlTowerSamExtensionPipelineArtifactS3Bucket.Arn}/*
+              - !If
+                - IsCodeCommitPipelineSource
+                - !Ref AWS::NoValue
+                - Effect: "Allow"
+                  Action:
+                    - s3:GetObject
+                  Resource: !Sub "${CustomControlTowerSamExtensionPipelineS3Bucket.Arn}/*"
+              - Effect: "Allow"
+                Action:
+                  - s3:PutObject
+                Resource:
+                  !Join [
+                    "",
+                    [
+                      !Sub "arn:${AWS::Partition}:s3:::",
+                      !FindInMap [S3, SAMPackageBuckets, NamePrefix],
+                      !Ref AWS::AccountId,
+                      "-*/*",
+                    ],
+                  ]
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource:
+                  !Join [
+                    "",
+                    [
+                      !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter",
+                      !FindInMap [SSM, Parameters, Path],
+                      "/*",
+                    ],
+                  ]
+              - !If
+                - IsContinuousDeploymentEnabled
+                - Effect: Allow
+                  Action:
+                    - codepipeline:StartPipelineExecution
+                  Resource: !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:Custom-Control-Tower-CodePipeline
+                - !Ref AWS::NoValue
+
+  ###
+  # CodeBuild creates SAM packages and stores them on regional S3 buckets.
+  ###
+
+  CustomControlTowerSamExtensionCodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cfct-sam-extension
+      Description: Executes SAM build, SAM package, and stores outputs on regional S3 buckets.
+      ServiceRole: !GetAtt CustomControlTowerSamExtensionCodeBuildRole.Arn
+      EncryptionKey: !Sub
+        - alias/${KeyName}
+        - { KeyName: !FindInMap [KMS, Alias, Name] }
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - sam --version
+                - python --version
+                - node --version
+                - ruby --version
+            pre_build:
+              commands:
+                - |
+                  cat <<EOF >> execute.py
+                  import os
+                  from subprocess import check_output
+                  import boto3
+                  import logging
+                  import json
+                  import io
+                  from botocore.exceptions import ClientError
+
+                  logging.basicConfig()
+                  logger = logging.getLogger(__name__)
+                  logger.setLevel(logging.DEBUG)
+
+                  s3  = boto3.client('s3')
+                  ssm = boto3.client('ssm')
+
+                  enabled_regions       = os.environ["EnabledRegions"]
+                  destination_bucket    = os.environ["DestinationBucketWithoutRegion"]
+                  continous_deployment  = os.environ["EnableContinuousDeployment"]
+                  ssm_parameters_path   = os.environ["SsmParametersPath"]
+
+
+                  def deploy_serverless_apis():
+                      """
+                      This function uploads api.json files to S3 only. No specific AWS SAM call/transformation needed.
+
+                      The uploaded file can be consumed by CfCT via AWS::Serverless::Api.DocumentUri.
+                      """
+                      logger.info("Execute serverless-apis")
+
+                      root_dir = "serverless-apis"
+                      dirs     = get_dirs_to_execute(root_dir)
+
+                      if not dirs:
+                          return
+
+                      for dir_name in dirs:
+                          runtime_config = None
+                          file_path = f"{root_dir}/{dir_name}/api.json"
+
+                          try:
+                              with open(file_path) as f:
+                                  # Check if valid JSON is included.
+                                  json.load(f)
+                          except FileNotFoundError as e:
+                              logger.error("serverless-api(s) need an api.json file to package for S3 upload.")
+                              logger.error(e)
+                              raise e
+
+                          for enabled_region in enabled_regions.split(","):
+                              bucket_name = f"{destination_bucket}-{enabled_region}"
+
+                              s3.upload_file(file_path, bucket_name, file_path)
+
+                          # Create or Update SSM Parameter
+                          try:
+                              logger.debug(f"ssm-value-to-store: {ssm_parameters_path}/{root_dir}/{dir_name}={file_path}")
+                              ssm.put_parameter(Name=f"{ssm_parameters_path}/{root_dir}/{dir_name}", Value=file_path,
+                                                Type='String', Overwrite=True, Tier='Standard')
+                          except ClientError as e:
+                              logger.error(e)
+
+
+                  def deploy_serverless_applications():
+                      """
+                      Builds and packages a full CFN stack.
+
+                      Output can be consumed by CfCT via AWS::CloudFormation::Stack.TemplateURL
+                      (Due to a bug in Serverless::Application's reference, the default CFN resource needs to be used. See cfct examples for more details.)
+                      """
+                      logger.info("Execute serverless-applications")
+
+                      root_dir = "serverless-applications"
+                      dirs = get_dirs_to_execute(root_dir)
+
+                      if not dirs:
+                          return
+
+                      for dir_name in dirs:
+
+                          execute_sam_build(root_dir, dir_name)
+
+                          template_name = f"{root_dir}/{dir_name}/template.yml"
+
+                          for enabled_region in enabled_regions.split(","):
+                              bucket_name = f"{destination_bucket}-{enabled_region}"
+
+                              # Package SAM source code to the destination bucket
+                              cmd_package = f"cd ./{root_dir}/{dir_name} && \
+                                              sam package \
+                                              --s3-bucket {bucket_name} \
+                                              --s3-prefix {root_dir}/{dir_name} \
+                                              --force-upload"
+                              logger.debug(cmd_package)
+
+                              template = check_output([cmd_package], shell=True)
+                              fileobject = io.BytesIO(template)
+                              s3.upload_fileobj(fileobject, bucket_name, template_name)
+
+                              logger.debug(f"file uploaded: {template_name}")
+
+                          # Create or Update SSM Parameter
+                          try:
+                              logger.debug(f"ssm-value-to-store: {ssm_parameters_path}/{root_dir}/{dir_name}={template_name}")
+                              ssm.put_parameter(Name=f"{ssm_parameters_path}/{root_dir}/{dir_name}", Value=template_name,
+                                                Type='String', Overwrite=True, Tier='Standard')
+                          except ClientError as e:
+                              logger.error(e)
+
+
+                  def deploy_serverless_functions():
+                      """
+                      AWS::Serverless::Function
+                      Builds and packages functions. It requires a config.json file with a runtime property to build via sam build.
+
+                      Output can be consumed by CfCT via AWS::Serverless::Function.CodeUri
+                      """
+                      logger.info("Execute serverless-functions")
+
+                      root_dir = "serverless-functions"
+                      dirs     = get_dirs_to_execute(root_dir)
+
+                      if not dirs:
+                          return
+
+                      for dir_name in dirs:
+                          runtime_config = None
+
+                          try:
+                              with open(f"./{root_dir}/{dir_name}/config.json") as f:
+                                  runtime_config = json.load(f)
+                          except FileNotFoundError as e:
+                              logger.error("serverless-function(s) need a config.json file to provide runtime to build with.")
+                              logger.error(e)
+                              raise e
+
+                          cfn_template = {
+                            "AWSTemplateFormatVersion": "2010-09-09",
+                            "Transform": "AWS::Serverless-2016-10-31",
+                            "Resources": {
+                              "LambdaFunction": {
+                                "Type": "AWS::Serverless::Function",
+                                "Properties": {
+                                  "CodeUri": ".",
+                                  "Runtime": runtime_config["runtime"],
+                                  "Handler": "irrelevant"
+                                }
+                              }
+                            }
+                          }
+
+                          with open(f"./{root_dir}/{dir_name}/template.json", "w") as template_file:
+                              json.dump(cfn_template, template_file, indent=4)
+
+                          execute_sam_build(root_dir, dir_name)
+
+                          for enabled_region in enabled_regions.split(","):
+                              bucket_name = f"{destination_bucket}-{enabled_region}"
+
+                              # Package SAM source code to the destination bucket
+                              cmd_package = f"cd ./{root_dir}/{dir_name} && \
+                                              sam package \
+                                              --s3-bucket {bucket_name} \
+                                              --s3-prefix {root_dir}/{dir_name} \
+                                              --force-upload \
+                                              --use-json \
+                                              | jq '.Resources.LambdaFunction.Properties.CodeUri' \
+                                              | jq 'match(\"(s3://.*?/)(.*)\").captures[1].string'"
+                              logger.debug(cmd_package)
+
+                              zip_file_path = check_output([cmd_package], shell=True)
+                              logger.debug(f"zip_file_path={zip_file_path}")
+                              zip_file_path_formatted = zip_file_path.lstrip(b"b'\"").rstrip().rstrip(b"\"")
+
+                          # Create or Update SSM Parameter
+                          try:
+                              logger.debug(f"ssm-value-to-store: {ssm_parameters_path}/{root_dir}/{dir_name}={zip_file_path_formatted.decode()}")
+                              ssm.put_parameter(Name=f"{ssm_parameters_path}/{root_dir}/{dir_name}", Value=zip_file_path_formatted.decode(),
+                                                Type='String', Overwrite=True, Tier='Standard')
+                          except ClientError as e:
+                              logger.error(e)
+
+
+                  def deploy_serverless_httpapis():
+                      """
+                      This function uploads api.json files to S3 only. No specific AWS SAM call/transformation needed.
+
+                      The uploaded file can be consumed by CfCT via AWS::Serverless::HttpApi.DocumentUri.
+                      """
+                      logger.info("Execute serverless-httpapis")
+
+                      root_dir = "serverless-httpapis"
+                      dirs     = get_dirs_to_execute(root_dir)
+
+                      if not dirs:
+                          return
+
+                      for dir_name in dirs:
+                          runtime_config = None
+                          file_path = f"{root_dir}/{dir_name}/api.json"
+
+                          try:
+                              with open(file_path) as f:
+                                  # Check if valid JSON is included.
+                                  json.load(f)
+                          except FileNotFoundError as e:
+                              logger.error("serverless-httpapi(s) need an api.json file to package for S3 upload.")
+                              logger.error(e)
+                              raise e
+
+                          for enabled_region in enabled_regions.split(","):
+                              bucket_name = f"{destination_bucket}-{enabled_region}"
+
+                              s3.upload_file(file_path, bucket_name, file_path)
+
+                          # Create or Update SSM Parameter
+                          try:
+                              logger.debug(f"ssm-value-to-store: {ssm_parameters_path}/{root_dir}/{dir_name}={file_path}")
+                              ssm.put_parameter(Name=f"{ssm_parameters_path}/{root_dir}/{dir_name}", Value=file_path,
+                                                Type='String', Overwrite=True, Tier='Standard')
+                          except ClientError as e:
+                              logger.error(e)
+
+
+                  def deploy_serverless_state_machines():
+                      """
+                      This function uploads state-machine.json files to S3 only. No specific AWS SAM call/transformation needed.
+
+                      The uploaded file can be consumed by CfCT via AWS::Serverless::StateMachine.DefinitionUri.
+                      """
+                      logger.info("Execute serverless-state-machines")
+
+                      root_dir = "serverless-state-machines"
+                      dirs     = get_dirs_to_execute(root_dir)
+
+                      if not dirs:
+                          return
+
+                      for dir_name in dirs:
+                          runtime_config = None
+                          file_path = f"{root_dir}/{dir_name}/state-machine.json"
+
+                          try:
+                              with open(file_path) as f:
+                                  # Check if valid JSON is included.
+                                  json.load(f)
+                          except FileNotFoundError as e:
+                              logger.error("serverless-state-machine(s) need an api.json file to package for S3 upload.")
+                              logger.error(e)
+                              raise e
+
+                          for enabled_region in enabled_regions.split(","):
+                              bucket_name = f"{destination_bucket}-{enabled_region}"
+
+                              s3.upload_file(file_path, bucket_name, file_path)
+
+                          # Create or Update SSM Parameter
+                          try:
+                              logger.debug(f"ssm-value-to-store: {ssm_parameters_path}/{root_dir}/{dir_name}={file_path}")
+                              ssm.put_parameter(Name=f"{ssm_parameters_path}/{root_dir}/{dir_name}", Value=file_path,
+                                                Type='String', Overwrite=True, Tier='Standard')
+                          except ClientError as e:
+                              logger.error(e)
+
+
+                  def get_dirs_to_execute(root_dir):
+                      if not os.path.isdir(f"./{root_dir}"):
+                          return
+
+                      dirs = [dir for dir in os.listdir(f"./{root_dir}/") if os.path.isdir(f"./{root_dir}/{dir}")]
+                      logger.debug(dirs)
+
+                      return dirs
+
+
+                  def execute_sam_build(root_dir, dir_name) -> str:
+                      cmd_build = f"cd ./{root_dir}/{dir_name} && sam build"
+                      logger.debug(cmd_build)
+
+                      return check_output([cmd_build], shell=True)
+
+
+                  deploy_serverless_apis()
+                  deploy_serverless_applications()
+                  deploy_serverless_functions()
+                  deploy_serverless_httpapis()
+                  deploy_serverless_state_machines()
+
+                  if continous_deployment == "true":
+                      codepipeline = boto3.client('codepipeline')
+                      codepipeline.start_pipeline_execution(name='Custom-Control-Tower-CodePipeline')
+                  EOF
+            build:
+              commands:
+                - python3 execute.py
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: "aws/codebuild/amazonlinux2-x86_64-standard:4.0"
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref CustomControlTowerSamExtensionPipelineArtifactS3Bucket
+          - Name: STAGE_NAME
+            Value: "build"
+          - Name: EnabledRegions
+            Value: !Join [",", !Ref EnabledRegions]
+          - Name: DestinationBucketWithoutRegion
+            Value:
+              !Join [
+                "",
+                [
+                  !FindInMap [S3, SAMPackageBuckets, NamePrefix],
+                  !Ref AWS::AccountId,
+                ],
+              ]
+          - Name: EnableContinuousDeployment
+            Value: !Ref EnableContinuousDeployment
+          - Name: SsmParametersPath
+            Value: !FindInMap [SSM, Parameters, Path]
+      Artifacts:
+        Name: !Sub ${CustomControlTowerSamExtensionPipelineArtifactS3Bucket}-Built
+        Type: CODEPIPELINE
+
+  ###
+  # CW Event Rule for triggering AWS CodePipeline from AWS CodeCommit - adopted from CfCT itself
+  ###
+
+  CustomControlTowerSamExtensionPipelineTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "events.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: cfct-sam-extension-cwe-execute-pipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${CustomControlTowerSamExtensionCodePipeline}
+
+  CustomControlTowerSamExtensionCloudTrailDataEventsBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsS3PipelineSource
+    Properties:
+      BucketName: !Sub cfct-sam-extension-cloudtrail-data-events-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CustomControlTowerSamExtensionS3AccessLogsBucket
+
+  CustomControlTowerSamExtensionCloudTrailDataEventsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: IsS3PipelineSource
+    Properties:
+      Bucket: !Ref CustomControlTowerSamExtensionCloudTrailDataEventsBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CustomControlTowerSamExtensionCloudTrailDataEventsBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CustomControlTowerSamExtensionCloudTrailDataEventsBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+
+  CustomControlTowerSamExtensionCloudTrailDataEvents:
+    Type: AWS::CloudTrail::Trail
+    Condition: IsS3PipelineSource
+    DependsOn:
+      - CustomControlTowerSamExtensionCloudTrailDataEventsBucketPolicy
+    Properties:
+      S3BucketName: !Ref CustomControlTowerSamExtensionCloudTrailDataEventsBucket
+      EventSelectors:
+        - DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Join [
+                    "",
+                    [
+                      !GetAtt CustomControlTowerSamExtensionPipelineS3Bucket.Arn,
+                      "/",
+                      !FindInMap [CodePipelineSource, S3Bucket, TriggerKey],
+                    ],
+                  ]
+          ReadWriteType: WriteOnly
+          IncludeManagementEvents: false
+      IncludeGlobalServiceEvents: true
+      IsLogging: true
+      IsMultiRegionTrail: true
+
+  CustomControlTowerSamExtensionCodeCommitPipelineTriggerS3Event:
+    Type: AWS::Events::Rule
+    Condition: IsS3PipelineSource
+    Properties:
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - CopyObject
+            - PutObject
+            - CompleteMultipartUpload
+          requestParameters:
+            bucketName:
+              - !Ref CustomControlTowerSamExtensionPipelineS3Bucket
+            key:
+              - !FindInMap [CodePipelineSource, S3Bucket, TriggerKey]
+      State: ENABLED
+      Targets:
+        - Arn: !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${CustomControlTowerSamExtensionCodePipeline}
+          Id: "CustomControlTower_Pipeline_S3Trigger"
+          RoleArn: !GetAtt CustomControlTowerSamExtensionPipelineTriggerRole.Arn
+
+  CustomControlTowerSamExtensionCodeCommitPipelineTriggerCWEventRule:
+    Type: AWS::Events::Rule
+    Condition: IsCodeCommitPipelineSource
+    Properties:
+      Description: Custom Control Tower SAM Extension - Rule for triggering CodePipeline from CodeCommit
+      EventPattern:
+        {
+          "source": ["aws.codecommit"],
+          "detail-type": ["CodeCommit Repository State Change"],
+          "resources":
+            [
+              !Sub "arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepositoryName}",
+            ],
+          "detail":
+            {
+              "event": ["referenceCreated", "referenceUpdated"],
+              "referenceType": ["branch"],
+              "referenceName":
+                [!FindInMap [CodePipelineSource, CodeCommit, BranchName]],
+            },
+        }
+      State: ENABLED
+      Targets:
+        - Arn: !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${CustomControlTowerSamExtensionCodePipeline}
+          Id: "CustomControlTowerSamExtension_Pipeline_Trigger"
+          RoleArn: !GetAtt CustomControlTowerSamExtensionPipelineTriggerRole.Arn
+
+  SSMPackageBucketPrefix:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name:
+        !Join [
+          "/",
+          [!FindInMap [SSM, Parameters, Path], "package-buckets-prefix"],
+        ]
+      Description: CfCT SAM extension parameter to reference within manifest.yaml for cross-region sam package usage.
+      Type: String
+      Value:
+        !Join [
+          "",
+          [!FindInMap [S3, SAMPackageBuckets, NamePrefix], !Ref AWS::AccountId],
+        ]
+
+Outputs:
+  CustomControlTowerSamExtensionCodePipeline:
+    Description: Custom Control Tower SAM Extension CodePipieline
+    Value: !Ref CustomControlTowerSamExtensionCodePipeline
+  CustomControlTowerSamExtensionVersion:
+    Description: Version Number
+    Value: v1.0.0
+    Export:
+      Name: cfct-sam-extension-version

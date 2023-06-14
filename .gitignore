@@ -1,0 +1,25 @@
+# Development
+.DS_Store
+.idea
+.vscode
+*.pyc
+*.so
+.eggs
+*.egg-info
+.cache
+*.sonarlint
+.python-version
+__pycache__
+.pytest_cache
+.mypy_cache
+
+# Ignore virtual environments
+venv
+.venv
+testing-venv
+
+# Ignore installed dependencies
+dist
+source/src/build
+.aws-sam/
+samples/cfct-sam-extension/serverless-functions/*/template.json

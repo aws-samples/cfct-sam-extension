@@ -1,0 +1,72 @@
+# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
+# A copy of the License is located at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# or in the "license" file accompanying this file. This file is distributed
+# on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+# express or implied. See the License for the specific language governing
+# permissions and limitations under the License.
+
+---
+# Home region for CodePipeline, StepFunctions, Lambda, SSM, StackSets
+region: eu-central-1 # Control Tower Home Region
+version: 2021-03-15
+
+resources:
+  - name: test-sam-extension
+    resource_file: test-sam-extension.yml
+    deploy_method: stack_set
+    parameters:
+      - parameter_key: SAMExtensionBucketsPrefix
+        parameter_value: $[alfred_ssm_/cfct-sam-extension/package-buckets-prefix]
+      - parameter_key: TestServerlessFunctionPackagePath
+        parameter_value: $[alfred_ssm_/cfct-sam-extension/serverless-functions/test-lambda]
+      - parameter_key: TestApiDefinitionPath
+        parameter_value: $[alfred_ssm_/cfct-sam-extension/serverless-apis/test-api]
+      - parameter_key: TestHttpApiDefinitionPath
+        parameter_value: $[alfred_ssm_/cfct-sam-extension/serverless-httpapis/test-httpapi]
+      - parameter_key: TestStateMachineDefinitionPath
+        parameter_value: $[alfred_ssm_/cfct-sam-extension/serverless-state-machines/test-state-machine]
+    deployment_targets:
+      organizational_units:
+        - Sandbox
+
+  - name: test-use-case-custom-config-rule
+    resource_file: templates/test-use-cases.yaml
+    deploy_method: stack_set
+    parameters:
+      - parameter_key: SAMExtensionBucketsPrefix
+        parameter_value: $[alfred_ssm_/cfct-sam-extension/package-buckets-prefix]
+      - parameter_key: TestUseCaseTemplatePath
+        parameter_value: $[alfred_ssm_/cfct-sam-extension/serverless-applications/custom-config-rule]
+    deployment_targets:
+      organizational_units:
+        - Sandbox
+
+  - name: test-use-case-s3-block-public-access
+    resource_file: templates/test-use-cases.yaml
+    deploy_method: stack_set
+    parameters:
+      - parameter_key: SAMExtensionBucketsPrefix
+        parameter_value: $[alfred_ssm_/cfct-sam-extension/package-buckets-prefix]
+      - parameter_key: TestUseCaseTemplatePath
+        parameter_value: $[alfred_ssm_/cfct-sam-extension/serverless-applications/s3-block-public-access]
+    deployment_targets:
+      organizational_units:
+        - Sandbox
+
+  - name: test-use-case-security-hub
+    resource_file: templates/test-use-cases.yaml
+    deploy_method: stack_set
+    parameters:
+      - parameter_key: SAMExtensionBucketsPrefix
+        parameter_value: $[alfred_ssm_/cfct-sam-extension/package-buckets-prefix]
+      - parameter_key: TestUseCaseTemplatePath
+        parameter_value: $[alfred_ssm_/cfct-sam-extension/serverless-applications/security-hub]
+    deployment_targets:
+      organizational_units:
+        - Sandbox

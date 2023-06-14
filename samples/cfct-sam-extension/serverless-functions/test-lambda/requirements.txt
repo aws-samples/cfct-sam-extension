@@ -1,0 +1,2 @@
+cfnresponse
+urllib3<2 # Fix for: https://github.com/psf/requests/issues/6443
