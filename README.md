@@ -10,7 +10,7 @@
 
 ## Introduction <!-- omit from toc -->
 Customers want flexibility and simpler ways to manage their AWS accounts.
-There are several ways customers can choose to customize their AWS account deployments at scale with flexibility such as [Account Factory Customization (AFC)](https://docs.aws.amazon.com/controltower/latest/userguide/af-customization-page.html) a native solution within AWS Control Tower account factory, or [Customizations for Control Tower (CfCT)](https://docs.aws.amazon.com/controltower/latest/userguide/cfct-overview.html) which this blog focuses on.
+There are several ways customers can choose to customize their AWS account deployments at scale with flexibility such as [Account Factory Customization (AFC)](https://docs.aws.amazon.com/controltower/latest/userguide/af-customization-page.html) a native solution within AWS Control Tower account factory, or [Customizations for Control Tower (CfCT)](https://docs.aws.amazon.com/controltower/latest/userguide/cfct-overview.html) which this repository focuses on.
 To perform account level operations with flexibility and less code, customers can use [AWS Serverless Application Model (AWS SAM)](https://aws.amazon.com/serverless/sam/) integration with CfCT that provides an easy way to establish a multi-account environment focused on operational excellence, security, reliability and performance.
 
 Customers can use AWS SAM and CfCT to perform account level operations such as deploying security services, serverless / event driven workflows, as well as implementing cost controls with significantly less code.
